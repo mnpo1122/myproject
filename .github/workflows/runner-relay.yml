@@ -1,0 +1,54 @@
+name: Relay
+
+on:
+  workflow_run:
+    workflows: ["Runner"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: relay-group
+  cancel-in-progress: true
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Time gate (12:00-02:00+1, Asia/Shanghai)
+        id: gate
+        run: |
+          # Chain window: 12:00 to 02:00 next day ("12-26" notation).
+          # Outside the window no new run is triggered; the next cron run
+          # starts a new chain.
+          export TZ=Asia/Shanghai
+          H=$(date +%H); H=$((10#$H))
+          echo "Local time: $(date '+%Y-%m-%d %H:%M %Z')"
+          if [ "$H" -ge 12 ] || [ "$H" -lt 2 ]; then
+            echo "allow=true" >> $GITHUB_OUTPUT
+            echo "inside window (H=$H) — will trigger next run"
+          else
+            echo "allow=false" >> $GITHUB_OUTPUT
+            echo "outside window (H=$H) — stop chaining"
+          fi
+
+      - name: Wait before next run
+        if: steps.gate.outputs.allow == 'true'
+        run: |
+          echo "Waiting 30 seconds before triggering next run..."
+          sleep 30
+
+      - name: Trigger next run
+        if: steps.gate.outputs.allow == 'true'
+        run: |
+          echo "Triggering next run..."
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.UPLOAD_API_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Content-Type: application/json" \
+            -d '{"ref":"main"}' \
+            "https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/actions/workflows/runner-run.yml/dispatches"
+          echo "Next run triggered successfully!"
