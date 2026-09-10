@@ -21,7 +21,7 @@ concurrency:
 env:
   UPSTASH_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
   RUN_DURATION: 19800
-  CODEX_BOOTSTRAP_COUNT: 5
+  CODEX_BOOTSTRAP_COUNT: 10
 
 jobs:
   run:
@@ -104,11 +104,20 @@ jobs:
               print("remote storage not configured — skip credential restore")
               sys.exit(0)
 
-          def uget(path):
-              req = urllib.request.Request(
-                  f"https://{HOST}{path}", headers={"Authorization": f"Bearer {TOKEN}"})
-              with urllib.request.urlopen(req, timeout=20) as r:
-                  return json.loads(r.read().decode())["result"]
+          def uget(path, tries=4):
+              # Upstash REST rate-limits bursts — retry with backoff
+              last = None
+              for i in range(tries):
+                  try:
+                      time.sleep(0.15)
+                      req = urllib.request.Request(
+                          f"https://{HOST}{path}", headers={"Authorization": f"Bearer {TOKEN}"})
+                      with urllib.request.urlopen(req, timeout=20) as r:
+                          return json.loads(r.read().decode())["result"]
+                  except Exception as e:
+                      last = e
+                      time.sleep(1.5 * (i + 1))
+              raise last
 
           # wait for the service to init schema on fresh installs
           for _ in range(12):
@@ -122,15 +131,22 @@ jobs:
           con = sqlite3.connect(DB)
           con.row_factory = sqlite3.Row
 
+          # encodeChatGptWebCodexSecrets({cookie}) format. The request-time
+          # executor reads ONLY api_key (401 when empty) — providerSpecificData
+          # alone leaves connections recognized but unusable.
+          def encoded_secrets(cookie):
+              return json.dumps({"version": 2, "cookie": cookie}, ensure_ascii=False)
+
           def upsert(conn_id, name, email, cookie):
               now = datetime.datetime.now(datetime.timezone.utc).isoformat()
               psd = json.dumps({"cookie": cookie}, ensure_ascii=False)
+              enc = encoded_secrets(cookie)
               cur = con.execute("SELECT id FROM provider_connections WHERE id=?", (conn_id,))
               row = cur.fetchone()
               if row:
                   con.execute(
-                      "UPDATE provider_connections SET provider_specific_data=?, updated_at=? WHERE id=?",
-                      (psd, now, conn_id))
+                      "UPDATE provider_connections SET api_key=?, provider_specific_data=?, updated_at=? WHERE id=?",
+                      (enc, psd, now, conn_id))
                   return "updated"
               cur = con.execute(
                   "SELECT id FROM provider_connections WHERE provider='chatgpt-web-codex' AND name=?",
@@ -138,14 +154,14 @@ jobs:
               row = cur.fetchone()
               if row:
                   con.execute(
-                      "UPDATE provider_connections SET provider_specific_data=?, updated_at=? WHERE id=?",
-                      (psd, now, row["id"]))
+                      "UPDATE provider_connections SET api_key=?, provider_specific_data=?, updated_at=? WHERE id=?",
+                      (enc, psd, now, row["id"]))
                   return "updated"
               con.execute(
                   """INSERT INTO provider_connections
-                     (id, provider, auth_type, name, email, is_active, provider_specific_data, created_at, updated_at)
-                     VALUES (?,?,?,?,?,1,?,?,?)""",
-                  (conn_id, "chatgpt-web-codex", "cookie", name, email, psd, now, now))
+                     (id, provider, auth_type, name, email, is_active, api_key, provider_specific_data, created_at, updated_at)
+                     VALUES (?,?,?,?,?,1,?,?,?,?)""",
+                  (conn_id, "chatgpt-web-codex", "cookie", name, email, enc, psd, now, now))
               return "inserted"
 
           # pool cookies[] -> service cookie header
@@ -171,9 +187,29 @@ jobs:
                       return v.strip()
               return ""
 
+          def api_key_has_secrets(value):
+              # enc:v1:… values were written by the app itself — trust them
+              if not value or not isinstance(value, str) or not value.strip():
+                  return False
+              v = value.strip()
+              if v.startswith("enc:v1:"):
+                  return True
+              try:
+                  o = json.loads(v)
+              except Exception:
+                  return True  # raw cookie header — decodable by the executor
+              return isinstance(o, dict) and bool(o.get("cookie") or o.get("storageState"))
+
+          def parse_ts(v):
+              try:
+                  dt = datetime.datetime.fromisoformat(str(v or "").strip().replace("Z", "+00:00"))
+                  return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+              except Exception:
+                  return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
           # 1) refresh existing local rows by email against same-name pool keys
           local_rows = con.execute(
-              "SELECT id, name, email, provider_specific_data FROM provider_connections "
+              "SELECT id, name, email, api_key, provider_specific_data FROM provider_connections "
               "WHERE provider='chatgpt-web-codex'").fetchall()
           print(f"local web-codex connections: {len(local_rows)}")
           refreshed = 0
@@ -199,28 +235,34 @@ jobs:
                   if isinstance(obj, dict) else ""
               if not header:
                   continue
-              if header != current_cookie(r):
+              # rewrite when the pool is newer OR when api_key is missing —
+              # the latter self-heals rows restored before the api_key fix
+              if header != current_cookie(r) or not api_key_has_secrets(r["api_key"]):
                   upsert(r["id"], r["name"] or email, email, header)
                   refreshed += 1
                   print(f"  refreshed stored account cookie_len={len(header)}")
               else:
                   print(f"  stored account already fresh")
 
-          # 2) bootstrap first N pool keys only when the local table is empty
+          # 2) local table empty (fresh database): sample the pool randomly and
+          # import the freshest sessions. Alphabetical order = oldest accounts
+          # first, which is why bootstrapping pool[:N] yields dead sessions.
           bootstrapped = 0
           if len(local_rows) == 0 and BOOTSTRAP_N > 0:
               try:
-                  pool = sorted(uget("/keys/chatgpt2api:session:*") or [])
+                  pool = uget("/keys/chatgpt2api:session:*") or []
               except Exception as e:
                   print(f"pool KEYS failed: {e}")
                   pool = []
-              print(f"pool keys: {len(pool)} (bootstrap up to {BOOTSTRAP_N})")
-              for k in pool[:BOOTSTRAP_N]:
+              print(f"pool keys: {len(pool)}")
+              import random as _random
+              cands = []
+              for k in _random.sample(pool, min(40, len(pool))):
                   try:
                       raw = uget(f"/get/{urllib.parse.quote(k, safe='')}")
                       obj = json.loads(raw) if isinstance(raw, str) else raw
                   except Exception as e:
-                      print(f"bootstrap GET failed: {e}")
+                      print(f"bootstrap sample GET failed: {e}")
                       continue
                   if not isinstance(obj, dict):
                       continue
@@ -228,6 +270,10 @@ jobs:
                   header = header_from_cookies(obj.get("cookies"))
                   if not header or "@" not in email:
                       continue
+                  cands.append((parse_ts(obj.get("updated_at")), email, header))
+              cands.sort(key=lambda t: t[0], reverse=True)
+              print(f"sampled {len(cands)} usable sessions, importing top {BOOTSTRAP_N} by freshness")
+              for _, email, header in cands[:BOOTSTRAP_N]:
                   slug = re.sub(r"[^A-Za-z0-9]+", "-", email).strip("-")[:40] or hashlib.sha1(
                       header.encode()).hexdigest()[:12]
                   res = upsert(f"codex-upstash-{slug}", email, email, header)
@@ -308,7 +354,7 @@ jobs:
           UPSTASH_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
         run: |
           python3 << 'PYEOF'
-          import datetime, json, os, re, sqlite3, sys
+          import datetime, hashlib, json, os, re, sqlite3, sys, time
           import urllib.parse, urllib.request
 
           DATA_DIR = os.path.join(os.environ.get("GITHUB_WORKSPACE", os.getcwd()), "omni-data")
@@ -330,11 +376,20 @@ jobs:
               print("local database missing — nothing to sync")
               sys.exit(0)
 
-          def uget(path):
-              req = urllib.request.Request(
-                  f"https://{HOST}{path}", headers={"Authorization": f"Bearer {TOKEN}"})
-              with urllib.request.urlopen(req, timeout=20) as r:
-                  return json.loads(r.read().decode())["result"]
+          def uget(path, tries=4):
+              # Upstash REST rate-limits bursts — retry with backoff
+              last = None
+              for i in range(tries):
+                  try:
+                      time.sleep(0.15)
+                      req = urllib.request.Request(
+                          f"https://{HOST}{path}", headers={"Authorization": f"Bearer {TOKEN}"})
+                      with urllib.request.urlopen(req, timeout=20) as r:
+                          return json.loads(r.read().decode())["result"]
+                  except Exception as e:
+                      last = e
+                      time.sleep(1.5 * (i + 1))
+              raise last
 
           def uset(key, value_json):
               path = f"/set/{urllib.parse.quote(key, safe='')}/{urllib.parse.quote(value_json, safe='')}"
@@ -403,11 +458,28 @@ jobs:
           con.row_factory = sqlite3.Row
           try:
               rows = con.execute(
-                  "SELECT id, name, email, provider_specific_data FROM provider_connections "
+                  "SELECT id, name, email, api_key, provider_specific_data FROM provider_connections "
                   "WHERE provider='chatgpt-web-codex'").fetchall()
           except Exception as e:
               print(f"query failed: {e}")
               rows = []
+
+          def live_header(conn_id):
+              # browser storage state refreshed by the runtime during the run —
+              # the freshest cookies; falls back to the database copy
+              try:
+                  seg = hashlib.sha256(conn_id.encode()).hexdigest()[:32]
+                  p = os.path.join(DATA_DIR, "chatgpt-web-codex", "connections",
+                                   seg, "storage-state.json")
+                  with open(p, encoding="utf-8") as f:
+                      st = json.load(f)
+                  parts = []
+                  for c in st.get("cookies") or []:
+                      if isinstance(c, dict) and c.get("name") and c.get("value"):
+                          parts.append(f"{c['name']}={c['value']}")
+                  return "; ".join(parts)
+              except Exception:
+                  return ""
 
           now = datetime.datetime.now(datetime.timezone.utc).isoformat()
           pushed, skipped = 0, 0
@@ -417,17 +489,27 @@ jobs:
               if "@" not in email:
                   skipped += 1
                   continue
-              try:
-                  psd = json.loads(r["provider_specific_data"] or "{}")
-              except Exception:
-                  psd = {}
-              cookie = ""
-              for k in ("cookie", "sessionToken", "session-token",
-                        "__Secure-next-auth.session-token"):
-                  v = (psd.get(k) or "").strip() if isinstance(psd.get(k), str) else ""
-                  if v:
-                      cookie = v
-                      break
+              cookie, src = live_header(cid), "live-storage"
+              if not cookie:
+                  try:
+                      psd = json.loads(r["provider_specific_data"] or "{}")
+                  except Exception:
+                      psd = {}
+                  for k in ("cookie", "sessionToken", "session-token",
+                            "__Secure-next-auth.session-token"):
+                      v = (psd.get(k) or "").strip() if isinstance(psd.get(k), str) else ""
+                      if v:
+                          cookie, src = v, "db"
+                          break
+              if not cookie:
+                  # dashboard-created rows keep the secret in api_key
+                  raw_key = (r["api_key"] or "").strip()
+                  if raw_key.startswith("{"):
+                      try:
+                          cookie = (json.loads(raw_key).get("cookie") or "").strip()
+                          src = "apikey"
+                      except Exception:
+                          cookie = ""
               pairs = parse_header(cookie)
               if not pairs:
                   skipped += 1
@@ -443,7 +525,7 @@ jobs:
               try:
                   uset(key, payload)
                   pushed += 1
-                  print(f"  synced account cookies={len(pairs)}")
+                  print(f"  synced account cookies={len(pairs)} via={src}")
               except Exception as e:
                   print(f"  pool SET failed: {e}")
 
