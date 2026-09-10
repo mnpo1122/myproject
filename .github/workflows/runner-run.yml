@@ -37,7 +37,9 @@ jobs:
 
       - name: Install service
         run: |
-          npm install -g omniroute
+          # pinned: translation logic is verified against 3.8.50 behavior
+          # (__Host-* strip required; harmless on newer versions)
+          npm install -g omniroute@3.8.50
           omniroute --version
           mkdir -p "$GITHUB_WORKSPACE/omni-data"
 
