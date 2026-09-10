@@ -188,15 +188,25 @@ jobs:
                   (conn_id, "chatgpt-web-codex", "cookie", name, email, enc, psd, now, now))
               return "inserted"
 
-          # pool cookies[] -> service cookie header
+          # pool cookies[] -> service cookie header.
+          # - drop __Host-* names: the npm 3.8.50 storage-state builder forces
+          #   a dot-domain on every cookie and CDP rejects __Host- cookies
+          #   with a Domain set ("Invalid cookie fields" -> dead connections).
+          # - drop values containing ';'/CTLs: they would corrupt the header
+          #   split on the way in. Session material is base64url, unaffected.
           def header_from_cookies(arr):
               parts = []
               for c in arr or []:
                   if not isinstance(c, dict):
                       continue
                   n, v = c.get("name"), c.get("value")
-                  if n and v:
-                      parts.append(f"{n}={v}")
+                  if not n or not v:
+                      continue
+                  if n.startswith("__Host-"):
+                      continue
+                  if ";" in v or any(ord(ch) < 32 or ord(ch) == 127 for ch in v):
+                      continue
+                  parts.append(f"{n}={v}")
               return "; ".join(parts)
 
           def current_cookie(row):
@@ -468,24 +478,37 @@ jobs:
                       pairs.append((n, v))
               return pairs
 
+          # MERGE, never replace: pool-only entries (csrf-token, other
+          # domains' cookies) survive our sync-back untouched; names present
+          # in our header get fresh values with their stored metadata kept.
           def translate_to_pool(email, pairs, existing, now):
-              old_by_name = {}
+              new_vals = {}
+              for n, v in pairs:
+                  new_vals[n] = v
+              arr = []
+              seen = set()
               if isinstance(existing, dict):
                   for c in existing.get("cookies") or []:
-                      if isinstance(c, dict) and c.get("name"):
-                          old_by_name[c["name"]] = c
-              arr = []
+                      if not isinstance(c, dict) or not c.get("name"):
+                          continue
+                      n = c["name"]
+                      if n in new_vals:
+                          c = dict(c)
+                          c["value"] = new_vals[n]
+                          seen.add(n)
+                      arr.append(c)
               for n, v in pairs:
-                  old = old_by_name.get(n) or {}
-                  arr.append({
-                      "name": n,
-                      "value": v,
-                      "domain": old.get("domain") or ".chatgpt.com",
-                      "path": old.get("path") or "/",
-                      "secure": old.get("secure", True if n.startswith(
-                          ("__Secure-", "__Host-")) else False),
-                      "httpOnly": old.get("httpOnly", False),
-                  })
+                  if n not in seen:
+                      seen.add(n)
+                      arr.append({
+                          "name": n,
+                          "value": v,
+                          "domain": ".chatgpt.com",
+                          "path": "/",
+                          "secure": True if n.startswith(
+                              ("__Secure-", "__Host-")) else False,
+                          "httpOnly": False,
+                      })
               if isinstance(existing, dict):
                   existing["cookies"] = arr
                   existing["updated_at"] = now
