@@ -4,8 +4,11 @@ name: Runner
 # Chaining: the relay workflow triggers the next run only inside the
 # 12:00-02:00+1 (Asia/Shanghai) window; outside it the chain stops and
 # the next cron run starts a new chain.
-# Each run lasts a fixed 5.5h (RUN_DURATION=19800). Session credentials
-# are restored from remote storage on boot and synced back on exit.
+# Boot order: install -> pre-init boot (schema only, then killed) ->
+# FULL pool pull + FULL import into the database -> real start.
+# The service never starts without a completed import.
+# Exit sync runs on success AND failure (if: always()).
+# Each run lasts a fixed 5.5h (RUN_DURATION=19800).
 on:
   schedule:
     - cron: "30 2 * * *"
@@ -21,11 +24,11 @@ concurrency:
 env:
   UPSTASH_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
   RUN_DURATION: 19800
-  CODEX_BOOTSTRAP_COUNT: 10
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -37,8 +40,7 @@ jobs:
           omniroute --version
           mkdir -p "$GITHUB_WORKSPACE/omni-data"
 
-      - name: Start service
-        id: start
+      - name: Pre-start database init
         run: |
           DATA_DIR="$GITHUB_WORKSPACE/omni-data"
           mkdir -p "$DATA_DIR"
@@ -50,32 +52,38 @@ jobs:
           export ENABLE_TLS_FINGERPRINT=true
           export OMNIROUTE_PUBLIC_BASE_URL="${{ secrets.OMNIROUTE_PUBLIC_BASE_URL }}"
 
-          nohup omniroute > /tmp/app.log 2>&1 &
-          APP_PID=$!
-          echo "pid=$APP_PID" >> $GITHUB_OUTPUT
-
-          sleep 8
-          READY=0
-          for i in $(seq 1 15); do
-            CODE=$(curl -sk -o /dev/null -w '%{http_code}' http://localhost:20128/ --max-time 5 2>/dev/null || echo 000)
-            echo "boot probe $i: HTTP $CODE"
-            if [ "$CODE" != "000" ] && [ -n "$CODE" ]; then
-              READY=1
+          # temporary boot: only to let the service create its schema.
+          # Killed as soon as storage.sqlite appears; the real start
+          # happens after the full credential import below.
+          nohup omniroute > /tmp/init.log 2>&1 &
+          INIT_PID=$!
+          OK=0
+          for i in $(seq 1 36); do
+            if [ -f "$DATA_DIR/storage.sqlite" ]; then
+              OK=1
               break
             fi
-            sleep 2
+            if ! kill -0 $INIT_PID 2>/dev/null; then
+              echo "init process died early:"
+              tail -n 50 /tmp/init.log || true
+              break
+            fi
+            sleep 5
           done
-          if [ "$READY" = "1" ] && [ "$CODE" -ge 200 ] 2>/dev/null && [ "$CODE" -lt 500 ] 2>/dev/null; then
-            echo "Service ready (HTTP $CODE)"
-          else
-            echo "Service responded with HTTP ${CODE:-none}"
-            tail -n 100 /tmp/app.log || true
+          kill $INIT_PID 2>/dev/null || true
+          pkill -f "omniroute" 2>/dev/null || true
+          sleep 3
+          rm -f "$DATA_DIR/storage.sqlite-wal" "$DATA_DIR/storage.sqlite-shm" 2>/dev/null || true
+          if [ "$OK" != "1" ] || [ ! -f "$DATA_DIR/storage.sqlite" ]; then
+            echo "database was not initialized — refusing to start without imported credentials"
+            tail -n 100 /tmp/init.log || true
+            exit 1
           fi
+          echo "database initialized, init process stopped"
 
       - name: Restore session credentials
         env:
           UPSTASH_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
-          CODEX_BOOTSTRAP_COUNT: ${{ env.CODEX_BOOTSTRAP_COUNT }}
         run: |
           python3 << 'PYEOF'
           import datetime, hashlib, json, os, re, sqlite3, sys, time
@@ -83,7 +91,6 @@ jobs:
 
           DATA_DIR = os.path.join(os.environ.get("GITHUB_WORKSPACE", os.getcwd()), "omni-data")
           DB = os.path.join(DATA_DIR, "storage.sqlite")
-          BOOTSTRAP_N = int(os.environ.get("CODEX_BOOTSTRAP_COUNT", "5") or 5)
 
           # Remote storage REST derives from the redis:// URL secret (no redis-cli needed):
           #   redis://default:<token>@<host>:6379  ->  https://<host> + Bearer <token>
@@ -136,7 +143,7 @@ jobs:
                       time.sleep(1.5 * (i + 1))
               raise last
 
-          # wait for the service to init schema on fresh installs
+          # the database file is created by the pre-init boot step above
           for _ in range(12):
               if os.path.exists(DB):
                   break
@@ -217,111 +224,111 @@ jobs:
                   return True  # raw cookie header — decodable by the executor
               return isinstance(o, dict) and bool(o.get("cookie") or o.get("storageState"))
 
-          def parse_ts(v):
-              try:
-                  dt = datetime.datetime.fromisoformat(str(v or "").strip().replace("Z", "+00:00"))
-                  return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
-              except Exception:
-                  return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-
-          # 1) refresh existing local rows by email against same-name pool keys
-          local_rows = con.execute(
-              "SELECT id, name, email, api_key, provider_specific_data FROM provider_connections "
-              "WHERE provider='chatgpt-web-codex'").fetchall()
-          # bulk pull: ONE pipeline GET for all mapped pool keys
-          want = {}
-          for r in local_rows:
-              email = ((r["email"] or "").strip() or (r["name"] or "").strip())
-              if "@" in email:
-                  want[f"chatgpt2api:session:{email}"] = r
-              else:
-                  print(f"  skip row (no email, cannot map to pool key)")
-          print(f"local web-codex connections: {len(local_rows)}, mapped: {len(want)}")
-          pool = {}
-          wkeys = list(want)
-          for i in range(0, len(wkeys), 100):
-              chunk = wkeys[i:i + 100]
+          # FULL pull: every pool session in bulk, then FULL import below.
+          # Any incomplete pull aborts with exit 1 — the service is only
+          # started after a completed import (see boot order in the header).
+          try:
+              pool_keys = uget("/keys/chatgpt2api:session:*") or []
+          except Exception as e:
+              print(f"pool KEYS failed: {e}")
+              pool_keys = []
+          print(f"pool keys: {len(pool_keys)} — bulk pulling all sessions")
+          sessions = {}
+          complete = True
+          for i in range(0, len(pool_keys), 100):
+              chunk = pool_keys[i:i + 100]
               try:
                   resps = upipe([["GET", k] for k in chunk])
               except Exception as e:
-                  print(f"  bulk pool GET failed: {e}")
-                  continue
+                  print(f"  bulk GET chunk failed after retries, aborting: {e}")
+                  complete = False
+                  break
               for k, resp in zip(chunk, resps):
                   raw = (resp or {}).get("result")
                   if raw is None:
                       continue
                   try:
-                      pool[k] = json.loads(raw) if isinstance(raw, str) else raw
+                      obj = json.loads(raw) if isinstance(raw, str) else raw
                   except Exception:
                       continue
-          print(f"bulk pulled {len(pool)}/{len(wkeys)} pool sessions")
-          refreshed = 0
-          for k, r in want.items():
-              obj = pool.get(k)
-              if obj is None:
-                  print(f"  pool miss for stored account")
-                  continue
-              if not isinstance(obj, dict):
-                  continue
-              email = k.split(":")[-1]
+                  if isinstance(obj, dict):
+                      sessions[k] = obj
+          print(f"bulk pulled {len(sessions)}/{len(pool_keys)} pool sessions")
+          if not complete or (pool_keys and not sessions):
+              print("pull incomplete — refusing to start without a complete import")
+              sys.exit(1)
+
+          # FULL import: every usable pool session becomes a local connection
+          inserted, updated, skipped = 0, 0, 0
+          for k, obj in sessions.items():
+              email = (obj.get("email") or k.split(":")[-1] or "").strip()
               header = header_from_cookies(obj.get("cookies"))
-              if not header:
+              if not header or "@" not in email:
+                  skipped += 1
                   continue
-              # rewrite when the pool is newer OR when api_key is missing —
-              # the latter self-heals rows restored before the api_key fix
-              if header != current_cookie(r) or not api_key_has_secrets(r["api_key"]):
-                  upsert(r["id"], r["name"] or email, email, header)
-                  refreshed += 1
-                  print(f"  refreshed stored account cookie_len={len(header)}")
+              slug = re.sub(r"[^A-Za-z0-9]+", "-", email).strip("-")[:40] or hashlib.sha1(
+                  header.encode()).hexdigest()[:12]
+              cid = f"codex-upstash-{slug}"
+              cur = con.execute(
+                  "SELECT api_key, provider_specific_data FROM provider_connections WHERE id=?",
+                  (cid,))
+              ex = cur.fetchone()
+              if ex is None:
+                  # same account under another id (e.g. dashboard-created) -> reuse it
+                  cur = con.execute(
+                      "SELECT id, api_key, provider_specific_data FROM provider_connections "
+                      "WHERE provider='chatgpt-web-codex' AND name=?", (email,))
+                  ex2 = cur.fetchone()
+                  if ex2 is not None:
+                      cid, ex = ex2["id"], ex2
+              if ex is None:
+                  upsert(cid, email, email, header)
+                  inserted += 1
               else:
-                  print(f"  stored account already fresh")
-
-          # 2) local table empty (fresh database): bulk-pull the WHOLE pool once,
-          # rank locally by updated_at, import the freshest sessions.
-          bootstrapped = 0
-          if len(local_rows) == 0 and BOOTSTRAP_N > 0:
-              try:
-                  pool_keys = uget("/keys/chatgpt2api:session:*") or []
-              except Exception as e:
-                  print(f"pool KEYS failed: {e}")
-                  pool_keys = []
-              print(f"pool keys: {len(pool_keys)} — bulk pulling all sessions")
-              cands = []
-              for i in range(0, len(pool_keys), 100):
-                  chunk = pool_keys[i:i + 100]
-                  try:
-                      resps = upipe([["GET", k] for k in chunk])
-                  except Exception as e:
-                      print(f"  bulk GET chunk failed: {e}")
-                      continue
-                  for k, resp in zip(chunk, resps):
-                      raw = (resp or {}).get("result")
-                      if raw is None:
-                          continue
-                      try:
-                          obj = json.loads(raw) if isinstance(raw, str) else raw
-                      except Exception:
-                          continue
-                      if not isinstance(obj, dict):
-                          continue
-                      email = (obj.get("email") or k.split(":")[-1] or "").strip()
-                      header = header_from_cookies(obj.get("cookies"))
-                      if not header or "@" not in email:
-                          continue
-                      cands.append((parse_ts(obj.get("updated_at")), email, header))
-              cands.sort(key=lambda t: t[0], reverse=True)
-              print(f"bulk pulled {len(cands)} usable sessions, importing top {BOOTSTRAP_N} by freshness")
-              for _, email, header in cands[:BOOTSTRAP_N]:
-                  slug = re.sub(r"[^A-Za-z0-9]+", "-", email).strip("-")[:40] or hashlib.sha1(
-                      header.encode()).hexdigest()[:12]
-                  res = upsert(f"codex-upstash-{slug}", email, email, header)
-                  bootstrapped += 1
-                  print(f"  bootstrapped account -> {res} cookie_len={len(header)}")
-
+                  fake = {"provider_specific_data": ex["provider_specific_data"]}
+                  if header != current_cookie(fake) or not api_key_has_secrets(ex["api_key"]):
+                      upsert(cid, email, email, header)
+                      updated += 1
           con.commit()
           con.close()
-          print(f"credential restore done: refreshed={refreshed} bootstrapped={bootstrapped}")
+          print(f"full import done: pulled={len(sessions)} inserted={inserted} updated={updated} skipped={skipped}")
           PYEOF
+
+      - name: Start service
+        id: start
+        run: |
+          DATA_DIR="$GITHUB_WORKSPACE/omni-data"
+          mkdir -p "$DATA_DIR"
+          export DATA_DIR PORT=20128 HOSTNAME=0.0.0.0 NODE_ENV=production
+          export JWT_SECRET="${{ secrets.JWT_SECRET }}"
+          export API_KEY_SECRET="${{ secrets.API_KEY_SECRET }}"
+          export INITIAL_PASSWORD="${{ secrets.INITIAL_PASSWORD }}"
+          export OMNIROUTE_ENABLE_RUNTIME_BACKGROUND_TASKS=true
+          export ENABLE_TLS_FINGERPRINT=true
+          export OMNIROUTE_PUBLIC_BASE_URL="${{ secrets.OMNIROUTE_PUBLIC_BASE_URL }}"
+
+          # real start: runs only after the full credential import above
+          nohup omniroute > /tmp/app.log 2>&1 &
+          APP_PID=$!
+          echo "pid=$APP_PID" >> $GITHUB_OUTPUT
+
+          sleep 8
+          READY=0
+          for i in $(seq 1 15); do
+            CODE=$(curl -sk -o /dev/null -w '%{http_code}' http://localhost:20128/ --max-time 5 2>/dev/null || echo 000)
+            echo "boot probe $i: HTTP $CODE"
+            if [ "$CODE" != "000" ] && [ -n "$CODE" ]; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$READY" = "1" ] && [ "$CODE" -ge 200 ] 2>/dev/null && [ "$CODE" -lt 500 ] 2>/dev/null; then
+            echo "Service ready (HTTP $CODE)"
+          else
+            echo "Service responded with HTTP ${CODE:-none}"
+            tail -n 100 /tmp/app.log || true
+          fi
 
       - name: Setup tunnel
         id: tunnel
