@@ -119,6 +119,23 @@ jobs:
                       time.sleep(1.5 * (i + 1))
               raise last
 
+          # bulk pipeline: one POST executes many commands at once
+          def upipe(cmds, tries=4):
+              body = json.dumps(cmds).encode()
+              last = None
+              for i in range(tries):
+                  try:
+                      req = urllib.request.Request(
+                          f"https://{HOST}/pipeline", data=body,
+                          headers={"Authorization": f"Bearer {TOKEN}",
+                                   "Content-Type": "application/json"})
+                      with urllib.request.urlopen(req, timeout=120) as r:
+                          return json.loads(r.read().decode())
+                  except Exception as e:
+                      last = e
+                      time.sleep(1.5 * (i + 1))
+              raise last
+
           # wait for the service to init schema on fresh installs
           for _ in range(12):
               if os.path.exists(DB):
@@ -211,28 +228,43 @@ jobs:
           local_rows = con.execute(
               "SELECT id, name, email, api_key, provider_specific_data FROM provider_connections "
               "WHERE provider='chatgpt-web-codex'").fetchall()
-          print(f"local web-codex connections: {len(local_rows)}")
-          refreshed = 0
+          # bulk pull: ONE pipeline GET for all mapped pool keys
+          want = {}
           for r in local_rows:
               email = ((r["email"] or "").strip() or (r["name"] or "").strip())
-              if "@" not in email:
+              if "@" in email:
+                  want[f"chatgpt2api:session:{email}"] = r
+              else:
                   print(f"  skip row (no email, cannot map to pool key)")
-                  continue
-              key = f"chatgpt2api:session:{email}"
+          print(f"local web-codex connections: {len(local_rows)}, mapped: {len(want)}")
+          pool = {}
+          wkeys = list(want)
+          for i in range(0, len(wkeys), 100):
+              chunk = wkeys[i:i + 100]
               try:
-                  raw = uget(f"/get/{urllib.parse.quote(key, safe='')}")
+                  resps = upipe([["GET", k] for k in chunk])
               except Exception as e:
-                  print(f"  pool GET failed: {e}")
+                  print(f"  bulk pool GET failed: {e}")
                   continue
-              if raw is None:
+              for k, resp in zip(chunk, resps):
+                  raw = (resp or {}).get("result")
+                  if raw is None:
+                      continue
+                  try:
+                      pool[k] = json.loads(raw) if isinstance(raw, str) else raw
+                  except Exception:
+                      continue
+          print(f"bulk pulled {len(pool)}/{len(wkeys)} pool sessions")
+          refreshed = 0
+          for k, r in want.items():
+              obj = pool.get(k)
+              if obj is None:
                   print(f"  pool miss for stored account")
                   continue
-              try:
-                  obj = json.loads(raw) if isinstance(raw, str) else raw
-              except Exception:
+              if not isinstance(obj, dict):
                   continue
-              header = header_from_cookies((obj or {}).get("cookies")) \
-                  if isinstance(obj, dict) else ""
+              email = k.split(":")[-1]
+              header = header_from_cookies(obj.get("cookies"))
               if not header:
                   continue
               # rewrite when the pool is newer OR when api_key is missing —
@@ -244,35 +276,41 @@ jobs:
               else:
                   print(f"  stored account already fresh")
 
-          # 2) local table empty (fresh database): sample the pool randomly and
-          # import the freshest sessions. Alphabetical order = oldest accounts
-          # first, which is why bootstrapping pool[:N] yields dead sessions.
+          # 2) local table empty (fresh database): bulk-pull the WHOLE pool once,
+          # rank locally by updated_at, import the freshest sessions.
           bootstrapped = 0
           if len(local_rows) == 0 and BOOTSTRAP_N > 0:
               try:
-                  pool = uget("/keys/chatgpt2api:session:*") or []
+                  pool_keys = uget("/keys/chatgpt2api:session:*") or []
               except Exception as e:
                   print(f"pool KEYS failed: {e}")
-                  pool = []
-              print(f"pool keys: {len(pool)}")
-              import random as _random
+                  pool_keys = []
+              print(f"pool keys: {len(pool_keys)} — bulk pulling all sessions")
               cands = []
-              for k in _random.sample(pool, min(40, len(pool))):
+              for i in range(0, len(pool_keys), 100):
+                  chunk = pool_keys[i:i + 100]
                   try:
-                      raw = uget(f"/get/{urllib.parse.quote(k, safe='')}")
-                      obj = json.loads(raw) if isinstance(raw, str) else raw
+                      resps = upipe([["GET", k] for k in chunk])
                   except Exception as e:
-                      print(f"bootstrap sample GET failed: {e}")
+                      print(f"  bulk GET chunk failed: {e}")
                       continue
-                  if not isinstance(obj, dict):
-                      continue
-                  email = (obj.get("email") or k.split(":")[-1] or "").strip()
-                  header = header_from_cookies(obj.get("cookies"))
-                  if not header or "@" not in email:
-                      continue
-                  cands.append((parse_ts(obj.get("updated_at")), email, header))
+                  for k, resp in zip(chunk, resps):
+                      raw = (resp or {}).get("result")
+                      if raw is None:
+                          continue
+                      try:
+                          obj = json.loads(raw) if isinstance(raw, str) else raw
+                      except Exception:
+                          continue
+                      if not isinstance(obj, dict):
+                          continue
+                      email = (obj.get("email") or k.split(":")[-1] or "").strip()
+                      header = header_from_cookies(obj.get("cookies"))
+                      if not header or "@" not in email:
+                          continue
+                      cands.append((parse_ts(obj.get("updated_at")), email, header))
               cands.sort(key=lambda t: t[0], reverse=True)
-              print(f"sampled {len(cands)} usable sessions, importing top {BOOTSTRAP_N} by freshness")
+              print(f"bulk pulled {len(cands)} usable sessions, importing top {BOOTSTRAP_N} by freshness")
               for _, email, header in cands[:BOOTSTRAP_N]:
                   slug = re.sub(r"[^A-Za-z0-9]+", "-", email).strip("-")[:40] or hashlib.sha1(
                       header.encode()).hexdigest()[:12]
@@ -391,12 +429,22 @@ jobs:
                       time.sleep(1.5 * (i + 1))
               raise last
 
-          def uset(key, value_json):
-              path = f"/set/{urllib.parse.quote(key, safe='')}/{urllib.parse.quote(value_json, safe='')}"
-              req = urllib.request.Request(
-                  f"https://{HOST}{path}", headers={"Authorization": f"Bearer {TOKEN}"})
-              with urllib.request.urlopen(req, timeout=20) as r:
-                  return json.loads(r.read().decode())["result"]
+          # bulk pipeline: one POST executes many commands at once
+          def upipe(cmds, tries=4):
+              body = json.dumps(cmds).encode()
+              last = None
+              for i in range(tries):
+                  try:
+                      req = urllib.request.Request(
+                          f"https://{HOST}/pipeline", data=body,
+                          headers={"Authorization": f"Bearer {TOKEN}",
+                                   "Content-Type": "application/json"})
+                      with urllib.request.urlopen(req, timeout=180) as r:
+                          return json.loads(r.read().decode())
+                  except Exception as e:
+                      last = e
+                      time.sleep(1.5 * (i + 1))
+              raise last
 
           # service cookie header -> pool cookies[].
           # Same-name entries keep their stored metadata, only value is refreshed;
@@ -481,13 +529,14 @@ jobs:
               except Exception:
                   return ""
 
+          # resolve all cookies locally first (zero network), then ONE bulk
+          # pull for metadata preservation + ONE bulk upload
           now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-          pushed, skipped = 0, 0
+          jobs = []  # (email, pairs, src)
           for r in rows:
               cid = r["id"]
               email = ((r["email"] or "").strip() or (r["name"] or "").strip())
               if "@" not in email:
-                  skipped += 1
                   continue
               cookie, src = live_header(cid), "live-storage"
               if not cookie:
@@ -511,23 +560,50 @@ jobs:
                       except Exception:
                           cookie = ""
               pairs = parse_header(cookie)
-              if not pairs:
-                  skipped += 1
-                  continue
-              key = f"chatgpt2api:session:{email}"
+              if pairs:
+                  jobs.append((email, pairs, src))
+          print(f"upload jobs: {len(jobs)}/{len(rows)}")
+
+          skeys = [f"chatgpt2api:session:{em}" for em, _, _ in jobs]
+          existing_map = {}
+          for i in range(0, len(skeys), 100):
+              chunk = skeys[i:i + 100]
               try:
-                  raw = uget(f"/get/{urllib.parse.quote(key, safe='')}")
-                  existing = json.loads(raw) if isinstance(raw, str) else raw
-              except Exception:
-                  existing = None
-              payload = json.dumps(
-                  translate_to_pool(email, pairs, existing, now), ensure_ascii=False)
-              try:
-                  uset(key, payload)
-                  pushed += 1
-                  print(f"  synced account cookies={len(pairs)} via={src}")
+                  resps = upipe([["GET", k] for k in chunk])
               except Exception as e:
-                  print(f"  pool SET failed: {e}")
+                  print(f"  bulk pool GET failed: {e}")
+                  continue
+              for k, resp in zip(chunk, resps):
+                  raw = (resp or {}).get("result")
+                  if raw is None:
+                      existing_map[k] = None
+                      continue
+                  try:
+                      existing_map[k] = json.loads(raw) if isinstance(raw, str) else raw
+                  except Exception:
+                      existing_map[k] = None
+
+          cmds, order = [], []
+          for (email, pairs, src), key in zip(jobs, skeys):
+              payload = json.dumps(
+                  translate_to_pool(email, pairs, existing_map.get(key), now),
+                  ensure_ascii=False)
+              cmds.append(["SET", key, payload])
+              order.append((email, len(pairs), src))
+          pushed = 0
+          for i in range(0, len(cmds), 25):
+              try:
+                  resps = upipe(cmds[i:i + 25])
+              except Exception as e:
+                  print(f"  bulk pool SET failed: {e}")
+                  continue
+              for (email, n, src), resp in zip(order[i:i + 25], resps):
+                  if (resp or {}).get("error"):
+                      print(f"  pool SET error: {str((resp or {}).get('error'))[:120]}")
+                  else:
+                      pushed += 1
+                      print(f"  synced account cookies={n} via={src}")
+          skipped = len(rows) - len(jobs)
 
           con.close()
           print(f"credential sync done: pushed={pushed} skipped={skipped}")
