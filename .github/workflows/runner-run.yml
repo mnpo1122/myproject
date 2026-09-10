@@ -249,36 +249,6 @@ jobs:
           sleep 5
           echo "Tunnel started"
 
-      - name: Start SSH server
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq openssh-server
-          sudo ssh-keygen -A
-          sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?AuthorizedKeysFile.*/AuthorizedKeysFile .ssh\/authorized_keys/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
-
-          SSH_PASS="${{ secrets.SSH_PASSWORD }}"
-          echo "runner:$SSH_PASS" | sudo chpasswd
-          echo "root:$SSH_PASS" | sudo chpasswd
-          sudo service ssh start
-          sudo ss -tlnp | grep :22 && echo "sshd running" || echo "sshd may not have started"
-
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          echo "${{ secrets.SSH_PUBLIC_KEY }}" >> ~/.ssh/authorized_keys
-          chmod 600 ~/.ssh/authorized_keys
-          chown -R runner:runner ~/.ssh 2>/dev/null || true
-
-          sudo mkdir -p /root/.ssh
-          sudo chmod 700 /root/.ssh
-          echo "${{ secrets.SSH_PUBLIC_KEY }}" | sudo tee -a /root/.ssh/authorized_keys > /dev/null
-          sudo chmod 600 /root/.ssh/authorized_keys
-          echo "SSH ready (key auth)"
-
       - name: Verify connectivity
         continue-on-error: true
         run: |
