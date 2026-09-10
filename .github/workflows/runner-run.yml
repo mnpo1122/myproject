@@ -5,7 +5,8 @@ name: Runner
 # 12:00-02:00+1 (Asia/Shanghai) window; outside it the chain stops and
 # the next cron run starts a new chain.
 # Boot order: install -> pre-init boot (schema only, then killed) ->
-# FULL pool pull + FULL import into the database -> real start.
+# FlareSolverr up -> FULL pool pull + FULL import (+ fresh local
+# cf_clearance merged in) -> real start.
 # The service never starts without a completed import.
 # Exit sync runs on success AND failure (if: always()).
 # Each run lasts a fixed 5.5h (RUN_DURATION=19800).
@@ -81,9 +82,35 @@ jobs:
           fi
           echo "database initialized, init process stopped"
 
+      - name: Start FlareSolverr
+        run: |
+          # Local challenge solver (same machine => clearance is bound to
+          # THIS runner's IP, which is exactly what the service needs).
+          docker run -d --name flaresolverr -p 8191:8191 \
+            -e LOG_LEVEL=warning \
+            ghcr.io/flaresolverr/flaresolverr:latest
+          OK=0
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8191/v1 \
+              -X POST -H 'Content-Type: application/json' \
+              -d '{"cmd":"sessions.list"}' --max-time 5 2>/dev/null || echo 000)
+            echo "flaresolverr probe $i: HTTP $CODE"
+            if [ "$CODE" != "000" ] && [ -n "$CODE" ]; then
+              OK=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$OK" != "1" ]; then
+            echo "FlareSolverr did not come up — import continues without fresh clearance"
+          else
+            echo "FlareSolverr ready"
+          fi
+
       - name: Restore session credentials
         env:
           UPSTASH_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
+          FLARESOLVERR_URL: http://127.0.0.1:8191
         run: |
           python3 << 'PYEOF'
           import datetime, hashlib, json, os, re, sqlite3, sys, time
@@ -209,6 +236,59 @@ jobs:
                   parts.append(f"{n}={v}")
               return "; ".join(parts)
 
+          CF_NAMES = ("cf_clearance", "__cf_bm", "_cfuvid")
+
+          def solve_challenge():
+              # ONE anonymous solve on this machine. Pool clearances are bound
+              # to the maintainer's IP and useless here; clearance is per-IP,
+              # not per-account, so a single solve covers every import.
+              # Best effort: failure only warns, import proceeds regardless.
+              base = (os.environ.get("FLARESOLVERR_URL") or "http://127.0.0.1:8191").rstrip("/")
+              try:
+                  body = json.dumps({"cmd": "request.get",
+                                     "url": "https://chatgpt.com/",
+                                     "maxTimeout": 60000}).encode()
+                  req = urllib.request.Request(base + "/v1", data=body,
+                                               headers={"Content-Type": "application/json"})
+                  with urllib.request.urlopen(req, timeout=90) as r:
+                      o = json.loads(r.read().decode())
+                  sol = (o or {}).get("solution") or {}
+                  if (o or {}).get("status") != "ok" or (sol.get("status") or 0) != 200:
+                      print(f"flaresolverr: no solution (status={(o or {}).get('status')})")
+                      return {}
+                  out = {}
+                  for c in sol.get("cookies") or []:
+                      if isinstance(c, dict) and c.get("name") and c.get("value"):
+                          if c["name"] in CF_NAMES or c["name"].startswith("cf_chl_"):
+                              out[c["name"]] = c["value"]
+                  if "cf_clearance" not in out:
+                      print("flaresolverr: solved but no cf_clearance in solution")
+                      return {}
+                  print(f"flaresolverr: solved, clearance cookies={sorted(out)}")
+                  return out
+              except Exception as e:
+                  print(f"flaresolverr unavailable, continuing without fresh clearance: {e}")
+                  return {}
+
+          def apply_clearance(header, solved):
+              if not solved:
+                  return header
+              pairs, seen = [], set()
+              for part in header.split(";"):
+                  part = part.strip()
+                  if not part or "=" not in part:
+                      continue
+                  n, v = part.split("=", 1)
+                  n = n.strip()
+                  if n in solved:
+                      v = solved[n]
+                      seen.add(n)
+                  pairs.append(f"{n}={v.strip()}")
+              for n, v in solved.items():
+                  if n not in seen:
+                      pairs.append(f"{n}={v}")
+              return "; ".join(pairs)
+
           def current_cookie(row):
               try:
                   psd = json.loads(row["provider_specific_data"] or "{}")
@@ -268,7 +348,10 @@ jobs:
               print("pull incomplete — refusing to start without a complete import")
               sys.exit(1)
 
-          # FULL import: every usable pool session becomes a local connection
+          # FULL import: every usable pool session becomes a local connection.
+          # Fresh local clearance (solved above) is merged into each header
+          # so the service browser skips the challenge on this machine.
+          solved = solve_challenge()
           inserted, updated, skipped = 0, 0, 0
           for k, obj in sessions.items():
               email = (obj.get("email") or k.split(":")[-1] or "").strip()
@@ -276,6 +359,7 @@ jobs:
               if not header or "@" not in email:
                   skipped += 1
                   continue
+              header = apply_clearance(header, solved)
               slug = re.sub(r"[^A-Za-z0-9]+", "-", email).strip("-")[:40] or hashlib.sha1(
                   header.encode()).hexdigest()[:12]
               cid = f"codex-upstash-{slug}"
@@ -478,12 +562,18 @@ jobs:
                       pairs.append((n, v))
               return pairs
 
+          CF_NAMES = ("cf_clearance", "__cf_bm", "_cfuvid")
+
           # MERGE, never replace: pool-only entries (csrf-token, other
           # domains' cookies) survive our sync-back untouched; names present
           # in our header get fresh values with their stored metadata kept.
+          # NEVER upload Cloudflare ephemeral cookies: they are bound to this
+          # runner's IP — pushing our copy would poison the shared pool.
           def translate_to_pool(email, pairs, existing, now):
               new_vals = {}
               for n, v in pairs:
+                  if n in CF_NAMES or n.startswith("cf_chl_"):
+                      continue
                   new_vals[n] = v
               arr = []
               seen = set()
