@@ -62,6 +62,7 @@ jobs:
         id: start
         run: |
           mkdir -p "$GITHUB_WORKSPACE/data"
+          docker pull "$IMAGE"
           docker run -d --name chatgpt2api \
             --network app-net \
             --restart unless-stopped \
