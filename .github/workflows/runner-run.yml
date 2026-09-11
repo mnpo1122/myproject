@@ -86,6 +86,15 @@ jobs:
           echo "=== boot sync ==="
           docker logs chatgpt2api 2>&1 | grep -i "upstash_boot_sync" | tail -n 3 || echo "(no boot sync line yet)"
 
+      - name: Setup tunnel
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          nohup cloudflared tunnel --no-autoupdate run --token "${{ secrets.CF_TUNNEL_TOKEN }}" > /dev/null 2>&1 &
+          echo "$!" > /tmp/cloudflared.pid
+          sleep 5
+          echo "Tunnel started"
+
       - name: Verify connectivity
         continue-on-error: true
         run: |
@@ -111,6 +120,13 @@ jobs:
               docker start chatgpt2api 2>/dev/null || true
               sleep 10
             fi
+            CF_PID=$(cat /tmp/cloudflared.pid 2>/dev/null || echo 0)
+            if [ "$CF_PID" -gt 0 ] && ! kill -0 $CF_PID 2>/dev/null; then
+              echo "[$(date)] tunnel died, restarting..."
+              nohup cloudflared tunnel --no-autoupdate run --token "${{ secrets.CF_TUNNEL_TOKEN }}" > /dev/null 2>&1 &
+              echo "$!" > /tmp/cloudflared.pid
+              sleep 3
+            fi
             if [ "$(docker inspect -f '{{.State.Running}}' flaresolverr 2>/dev/null)" != "true" ]; then
               echo "[$(date)] flaresolverr stopped, restarting..."
               docker start flaresolverr 2>/dev/null || true
@@ -126,4 +142,5 @@ jobs:
           echo "=== final sync state ==="
           docker logs chatgpt2api 2>&1 | grep -i "upstash_write_back" | tail -n 5 || echo "(no write-back lines)"
           docker stop chatgpt2api flaresolverr 2>/dev/null || true
+          kill "$(cat /tmp/cloudflared.pid 2>/dev/null)" 2>/dev/null || true
           echo "Done"
