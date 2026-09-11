@@ -37,33 +37,40 @@ jobs:
 
       - name: Start FlareSolverr
         run: |
+          docker network create app-net || true
           docker run -d --name flaresolverr \
+            --network app-net \
             --restart unless-stopped \
+            -p 8191:8191 \
             -e LOG_LEVEL=warning \
             ghcr.io/flaresolverr/flaresolverr:latest
           OK=0
           for i in $(seq 1 30); do
-            CODE=$(docker inspect -f '{{.State.Running}}' flaresolverr 2>/dev/null || echo false)
-            echo "flaresolverr probe $i: running=$CODE"
-            if [ "$CODE" = "true" ]; then
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8191/v1 \
+              -X POST -H 'Content-Type: application/json' \
+              -d '{"cmd":"sessions.list"}' --max-time 5 2>/dev/null || echo 000)
+            echo "flaresolverr probe $i: HTTP $CODE"
+            if [ "$CODE" != "000" ] && [ -n "$CODE" ]; then
               OK=1
               break
             fi
             sleep 5
           done
-          [ "$OK" = "1" ] && echo "FlareSolverr ready" || echo "FlareSolverr did not come up — clearance falls back to manual"
+          [ "$OK" = "1" ] && echo "FlareSolverr ready" || echo "FlareSolverr did not come up"
 
       - name: Start service
         id: start
         run: |
           mkdir -p "$GITHUB_WORKSPACE/data"
           docker run -d --name chatgpt2api \
+            --network app-net \
             --restart unless-stopped \
             -p 20128:80 \
             -v "$GITHUB_WORKSPACE/data:/app/data" \
             -e CHATGPT2API_AUTH_KEY="${{ secrets.CHATGPT2API_AUTH_KEY }}" \
             -e UPSTASH_REDIS_URL="${{ secrets.UPSTASH_REDIS_URL }}" \
             -e UPSTASH_SYNC_ENABLED=true \
+            -e FLARESOLVERR_URL="http://flaresolverr:8191" \
             -e TZ=Asia/Shanghai \
             "$IMAGE"
           sleep 10
@@ -144,4 +151,5 @@ jobs:
           docker logs chatgpt2api 2>&1 | grep -i "upstash_write_back" | tail -n 5 || echo "(no write-back lines)"
           kill $(cat /tmp/cloudflared.pid 2>/dev/null) 2>/dev/null || true
           docker stop chatgpt2api flaresolverr 2>/dev/null || true
+          docker network rm app-net 2>/dev/null || true
           echo "Done"
